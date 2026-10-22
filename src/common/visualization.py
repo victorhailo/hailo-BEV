@@ -8,15 +8,17 @@
 from pyquaternion import Quaternion
 import numpy as np
 import cv2
+import json
 import math
+import queue
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple
 
-from nuscenes.utils.geometry_utils import view_points, box_in_image, BoxVisibility
-from nuscenes.utils.data_classes import Box
 
 # Constants
 COLOR_RED = (0, 0, 255)
-COLOR_BLUE = (128, 0, 0)
+COLOR_LIGHT_BLUE = (255, 160, 40)
 COLOR_GRAY = (155, 155, 155)
 COLOR_GREEN = (0, 255, 0)
 COLOR_YELLOW = (0, 158, 255)
@@ -24,6 +26,8 @@ COLOR_DARK_BLUE = (60, 20, 220)
 COLOR_ORANGE = (0, 80, 255)
 
 LINE_WIDTH = 2
+BOX_LINE_WIDTH = 2  # at the displayed camera image size (IMAGE_WIDTH)
+COLOR_OUTLINE = (20, 20, 20)
 FRAME_WIDTH = 60
 FRAME_HEIGHT = 60
 IMAGE_WIDTH = 600
@@ -33,11 +37,11 @@ NUM_OF_IMAGES = 6
 
 
 def render_ego_centric_map(nusc,
-                           sample_token: str,
+                           sample_data_token: str,
                            axes_limit: float = 40) -> None:
     """
     Render map centered around the associated ego pose.
-    :param sample_data_token: Sample_data token.
+    :param sample_data_token: Sample_data token of the LIDAR_TOP record (keyframe or sweep) giving the ego pose.
     :param axes_limit: Axes limit measured in meters.
     :param ax: Axes onto which to render.
     """
@@ -56,12 +60,12 @@ def render_ego_centric_map(nusc,
         return cropped_image
 
     # Get data.
-    sample = nusc.get('sample', sample_token)
+    sd_record = nusc.get('sample_data', sample_data_token)
+    sample = nusc.get('sample', sd_record['sample_token'])
     scene = nusc.get('scene', sample['scene_token'])
     log = nusc.get('log', scene['log_token'])
     map_ = nusc.get('map', log['map_token'])
     map_mask = map_['mask']
-    sd_record = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
     pose = nusc.get('ego_pose', sd_record['ego_pose_token'])
 
     # Retrieve and crop mask.
@@ -89,55 +93,69 @@ def render_ego_centric_map(nusc,
     result_image = cv2.cvtColor(resized_image, cv2.COLOR_GRAY2BGR)
     return result_image
 
-def render_cv2_top_view(box,
-                   img: np.ndarray,
-                   view: np.ndarray = np.eye(3),
-                   normalize: bool = False,
-                   colors: Tuple = (COLOR_RED, COLOR_BLUE, COLOR_GRAY),
-                   linewidth: int = LINE_WIDTH) -> None:
+# Corner pattern of nuScenes Box.corners(): the first four corners face forward, the last four backward
+CORNER_SIGNS = np.array([[1,  1,  1,  1, -1, -1, -1, -1],
+                         [1, -1, -1,  1,  1, -1, -1,  1],
+                         [1,  1, -1, -1,  1,  1, -1, -1]], dtype=float)
+
+def quaternions_to_matrices(quaternions) -> np.ndarray:
     """
-    Renders box using OpenCV2.
-    :param im: <np.array: width, height, 3>. Image array. Channels are in BGR order.
-    :param view: <np.array: 3, 3>. Define a projection if needed (e.g. for drawing projection in an image).
-    :param normalize: Whether to normalize the remaining coordinate.
-    :param colors: ((R, G, B), (R, G, B), (R, G, B)). Colors for front, side & rear.
-    :param linewidth: Linewidth for plot.
+    Converts (N, 4) quaternions in (w, x, y, z) order to (N, 3, 3) rotation matrices.
     """
+    q = np.asarray(quaternions, dtype=float).reshape(-1, 4)
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    w, x, y, z = q.T
+    return np.stack([
+        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=-1),
+        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=-1),
+        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=-1)], axis=1)
 
-    corners = view_points(box.corners(), view, normalize=normalize)[:2, :]
-    corners[1, :] *= -1
-    for i in range(len(corners)):
-        for j in range(len(corners[i])):
-            corners[i][j] += 40
-            corners[i][j] *= 8
+def boxes_corners(annos) -> np.ndarray:
+    """
+    Computes the corners of all annotated boxes at once, in the same order as nuScenes Box.corners().
+    Building a nuScenes Box per annotation and per camera is much slower.
 
-    def draw_rect(selected_corners, color):
-        prev = selected_corners[-1]
-        for corner in selected_corners:
-            cv2.line(img,
-                        (int(prev[0]), int(prev[1])),
-                        (int(corner[0]), int(corner[1])),
-                        color, linewidth)
-            prev = corner
+    Returns:
+    - np.ndarray: (N, 3, 8) corners in global coordinates.
+    """
+    if not annos:
+        return np.zeros((0, 3, 8))
+    centers = np.array([anno['translation'] for anno in annos], dtype=float)
+    w, l, h = np.array([anno['size'] for anno in annos], dtype=float).T
+    half_sizes = np.stack([l, w, h], axis=1)[:, :, None] / 2
+    rotations = quaternions_to_matrices([anno['rotation'] for anno in annos])
+    return rotations @ (half_sizes * CORNER_SIGNS) + centers[:, :, None]
 
-    # Draw the sides
-    for i in range(4):
-        cv2.line(img,
-                    (int(corners.T[i][0]), int(corners.T[i][1])),
-                    (int(corners.T[i + 4][0]), int(corners.T[i + 4][1])),
-                    colors[2][::-1], linewidth)
+def draw_box(img, corners, color, linewidth, outline=None) -> None:
+    """
+    Draws a box with the same lines as nuScenes Box.render_cv2, with a single color.
 
-    # Draw front (first 4 corners) and rear (last 4 corners) rectangles(3d)/lines(2d)
-    draw_rect(corners.T[:4], colors[0][::-1])
-    draw_rect(corners.T[4:], colors[1][::-1])
+    Parameters:
+    - img (np.ndarray): Image to draw on, modified in-place.
+    - corners (np.ndarray): (2, 8) corner positions in pixels.
+    - color (tuple): Line color.
+    - linewidth (int): Line width.
+    - outline (tuple, optional): If given, the lines are first drawn wider in this color,
+      so that they stay visible on both light and dark backgrounds.
+    """
+    points = [(int(x), int(y)) for x, y in corners.T]
 
-    # Draw line indicating the front
+    # The sides, the front (first 4 corners) and rear (last 4 corners) rectangles
+    segments = [(points[i], points[i + 4]) for i in range(4)]
+    for rect in (points[:4], points[4:]):
+        segments += list(zip([rect[-1]] + rect[:-1], rect))
+
+    # Line indicating the front
     center_bottom_forward = np.mean(corners.T[2:4], axis=0)
     center_bottom = np.mean(corners.T[[2, 3, 7, 6]], axis=0)
-    cv2.line(img,
-                (int(center_bottom[0]), int(center_bottom[1])),
-                (int(center_bottom_forward[0]), int(center_bottom_forward[1])),
-                colors[0][::-1], linewidth)
+    segments.append(((int(center_bottom[0]), int(center_bottom[1])),
+                     (int(center_bottom_forward[0]), int(center_bottom_forward[1]))))
+
+    if outline is not None:
+        for start, end in segments:
+            cv2.line(img, start, end, outline, linewidth + 2, cv2.LINE_AA)
+    for start, end in segments:
+        cv2.line(img, start, end, color, linewidth, cv2.LINE_AA)
 
 def get_color(category_name: str) -> Tuple[int, int, int]:
     """
@@ -146,7 +164,7 @@ def get_color(category_name: str) -> Tuple[int, int, int]:
     as well as the nuScenes detection categories.
     """
     if "human" in category_name:
-        c = COLOR_BLUE
+        c = COLOR_LIGHT_BLUE
     elif "vehicle.car" in category_name or "vehicle.construction" in category_name:
         c = COLOR_YELLOW
     elif "vehicle.bicycle" in category_name or "vehicle.motorcycle" in category_name:
@@ -192,19 +210,20 @@ def show_bev(bev_image, annos, sample_token, nusc) -> np.ndarray:
     - np.ndarray: The annotated bird's-eye view image, rotated 90 degrees clockwise for correct orientation.
     """
     pose_record = nusc[sample_token]['LIDAR_TOP'][0]
-    boxes = []
-    for anno in annos:
-        boxes.append(Box(anno['translation'], anno['size'], Quaternion(anno['rotation']),
-                        name=anno['category_name'], token=anno['token']))
-    box_list = []
-    for box in boxes:
-        yaw = Quaternion(pose_record['rotation']).yaw_pitch_roll[0]
-        box.translate(-np.array(pose_record['translation']))
-        box.rotate(Quaternion(scalar=np.cos(yaw / 2), vector=[0, 0, np.sin(yaw / 2)]).inverse)
-        box_list.append(box)
-        c = get_color(box.name)
-        if "movable_object" not in box.name:
-            render_cv2_top_view(box, bev_image, view=np.eye(4), colors=(c, c, c))
+
+    # Global -> ego coordinates, rotating by the ego yaw only so the view stays level
+    yaw = Quaternion(pose_record['rotation']).yaw_pitch_roll[0]
+    yaw_inverse = Quaternion(scalar=np.cos(yaw / 2), vector=[0, 0, np.sin(yaw / 2)]).inverse.rotation_matrix
+    corners = yaw_inverse @ (boxes_corners(annos) - np.array(pose_record['translation'])[:, None])
+
+    # Top view: keep x and y, flip y, then shift and scale to pixels
+    corners = corners[:, :2, :]
+    corners[:, 1, :] *= -1
+    corners = (corners + 40) * 8
+
+    for anno, box_corners in zip(annos, corners):
+        if "movable_object" not in anno['category_name']:
+            draw_box(bev_image, box_corners, get_color(anno['category_name'])[::-1], LINE_WIDTH)
     rotated_image = rotate_image(bev_image, 90, bev_image.shape[0])
     return rotated_image
 
@@ -236,30 +255,32 @@ def show_image_with_boxes(sample_token, cv2_image, cam, annos, nusc) -> None:
 
     cam_intrinsic = np.array(cs_record['camera_intrinsic'])
 
-    imsize = (1600, 900)
-    boxes = []
-    for anno in annos:
-        boxes.append(Box(anno['translation'], anno['size'], Quaternion(anno['rotation']),
-                        name=anno['category_name'], token=anno['token']))
-    box_list = []
+    # The intrinsics are for the original 1600x900 image; rescale them to the size actually decoded
+    scale = cv2_image.shape[1] / 1600
+    cam_intrinsic[:2] *= scale
+    width, height = cv2_image.shape[1], cv2_image.shape[0]
+    line_width = max(1, round(BOX_LINE_WIDTH * cv2_image.shape[1] / IMAGE_WIDTH))
 
-    for box in boxes:
-        # Move box to ego vehicle coord system.
-        box.translate(-np.array(pose_record['translation']))
-        box.rotate(Quaternion(pose_record['rotation']).inverse)
+    # Global -> ego vehicle -> camera coordinates, for all boxes at once
+    corners = boxes_corners(annos)
+    corners = Quaternion(pose_record['rotation']).rotation_matrix.T @ (corners - np.array(pose_record['translation'])[:, None])
+    corners = Quaternion(cs_record['rotation']).rotation_matrix.T @ (corners - np.array(cs_record['translation'])[:, None])
 
-        #  Move box to sensor coord system.
-        box.translate(-np.array(cs_record['translation']))
-        box.rotate(Quaternion(cs_record['rotation']).inverse)
+    # Project to pixels
+    depth = corners[:, 2, :]
+    projected = cam_intrinsic @ corners
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pixels = projected[:, :2, :] / projected[:, 2:3, :]
 
-        if not box_in_image(box, cam_intrinsic, imsize, vis_level = BoxVisibility.ANY):
-            continue
-        box_list.append(box)
+    # Same rule as nuScenes box_in_image with BoxVisibility.ANY: at least one corner inside the image
+    # and more than 1m in front of the camera, and all corners at least 0.1m in front of the camera
+    visible = ((pixels[:, 0, :] > 0) & (pixels[:, 0, :] < width) &
+               (pixels[:, 1, :] > 0) & (pixels[:, 1, :] < height) & (depth > 1))
+    in_image = visible.any(axis=1) & (depth > 0.1).all(axis=1)
 
-    for box in box_list:
-        c = get_color(box.name)
-        if "movable_object" not in box.name:
-            box.render_cv2(cv2_image, view=cam_intrinsic, normalize=True, colors=(c, c, c))
+    for anno, box_pixels, show in zip(annos, pixels, in_image):
+        if show and "movable_object" not in anno['category_name']:
+            draw_box(cv2_image, box_pixels, get_color(anno['category_name'])[::-1], line_width, COLOR_OUTLINE)
 
 def combine_images(images, bev_image, fps_calc) -> np.ndarray:
     """
@@ -322,64 +343,204 @@ def combine_images(images, bev_image, fps_calc) -> np.ndarray:
     bev_height, bev_width, _ = bev_image.shape
     x_offset = total_width - bev_width
     y_offset = int((total_height - bev_height)/2)
-    float_fps = float(fps_calc.get_fps())
-    if float_fps > 14:
-        float_fps = f"{float_fps:.2f}"
-        text_size, _ = cv2.getTextSize(text, font, font_scale, font_thickness)
-        text_x = 2320
-        text_y = y_offset - 83
-        cv2.putText(combined_image, f'FPS {float_fps}', (text_x, text_y), font, font_scale, font_color, font_thickness)
     combined_image[y_offset:y_offset+bev_height, x_offset:x_offset+bev_width, :] = bev_image
     combined_image[y_offset, x_offset:, :] = [255, 255, 255]
 
     return combined_image
 
-def viz_proc(input_path, data_path, in_queue, fps_calc, nusc) -> None:
+def read_cam_image(path) -> np.ndarray:
+    # Decode at half resolution (800x450), which is much faster, then shrink to the displayed size,
+    # so that the boxes are drawn at the final resolution instead of being thinned by a later resize
+    image = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_2)
+    image = cv2.resize(image, (IMAGE_WIDTH, IMAGE_HEIGHT))
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+def render_frame(input_path, data_path, annos, token, nusc, fps_calc, read_pool) -> np.ndarray:
+    """
+    Renders the 6 camera images and the BEV image with the detected boxes into one BGR frame.
+    """
+    cams = ['CAM_FRONT_LEFT','CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    cam_images = list(read_pool.map(read_cam_image, [data_path + nusc[token][cam][2]['filename'] for cam in cams]))
+    bev_image = cv2.imread(input_path + nusc[token]['LIDAR_TOP'][2]['filename'])
+
+    cv2.rectangle(bev_image, (int(TOP_IMAGE_SIZE[0]/2) - 20,
+                                int(TOP_IMAGE_SIZE[0]/2) - 10),
+                                (int(TOP_IMAGE_SIZE[0]/2) + 20,
+                                int(TOP_IMAGE_SIZE[0]/2) + 10),
+                                COLOR_GREEN, thickness=LINE_WIDTH)
+
+    top_image = show_bev(bev_image,annos,token, nusc)
+    for cam_image, cam in zip(cam_images, cams):
+        show_image_with_boxes(token, cam_image, cam, annos, nusc)
+
+    combine_img = combine_images(cam_images, top_image, fps_calc)
+    return cv2.cvtColor(np.array(combine_img), cv2.COLOR_RGB2BGR)
+
+# Playback controls. Arrow key codes returned by cv2.waitKeyEx differ between GUI backends:
+# X11 keysyms (Qt and GTK on Linux), Windows virtual key codes, and Qt key codes
+KEYS_PREVIOUS = {65361, 2424832, 0x1000012}
+KEYS_NEXT = {65363, 2555904, 0x1000014}
+KEYS_PLAY_PAUSE = {ord(' ')}
+KEYS_QUIT = {ord('q'), ord('Q'), 27}
+HISTORY_SIZE = 300
+
+# Clickable buttons drawn in the white strip under the camera images: (action, x, y, width, height)
+BUTTON_SIZE = (90, 60)
+BUTTONS_Y = 2 * (IMAGE_HEIGHT + 2 * FRAME_HEIGHT) - FRAME_HEIGHT - 45
+BUTTONS = [('previous', 870, BUTTONS_Y), ('play_pause', 975, BUTTONS_Y), ('next', 1080, BUTTONS_Y)]
+
+def draw_controls(frame, paused, status, label='') -> None:
+    """
+    Draws the playback buttons and a status line in the bottom margin of the frame (modified in-place).
+    """
+    width, height = BUTTON_SIZE
+    for action, x, y in BUTTONS:
+        cv2.rectangle(frame, (x, y), (x + width, y + height), (225, 225, 225), -1)
+        cv2.rectangle(frame, (x, y), (x + width, y + height), (90, 90, 90), 2)
+        cx, cy = x + width // 2, y + height // 2
+        if action == 'previous':
+            shape = [[(cx + 15, cy - 18), (cx - 15, cy), (cx + 15, cy + 18)], [(cx - 20, cy - 18), (cx - 15, cy - 18), (cx - 15, cy + 18), (cx - 20, cy + 18)]]
+        elif action == 'next':
+            shape = [[(cx - 15, cy - 18), (cx + 15, cy), (cx - 15, cy + 18)], [(cx + 15, cy - 18), (cx + 20, cy - 18), (cx + 20, cy + 18), (cx + 15, cy + 18)]]
+        elif paused:
+            shape = [[(cx - 12, cy - 18), (cx + 16, cy), (cx - 12, cy + 18)]]
+        else:
+            shape = [[(cx - 13, cy - 18), (cx - 4, cy - 18), (cx - 4, cy + 18), (cx - 13, cy + 18)],
+                     [(cx + 4, cy - 18), (cx + 13, cy - 18), (cx + 13, cy + 18), (cx + 4, cy + 18)]]
+        cv2.fillPoly(frame, [np.array(points) for points in shape], (40, 40, 40))
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_y = BUTTONS_Y + height // 2 + 10
+    cv2.putText(frame, label, (FRAME_WIDTH, BUTTONS_Y + 18), font, 0.8, (0, 0, 0), 2)
+    cv2.putText(frame, status, (FRAME_WIDTH, BUTTONS_Y + 55), font, 0.8, (0, 0, 0), 2)
+    cv2.putText(frame, 'Space: play/pause   Left/Right: step   Q: quit', (1220, text_y), font, 0.8, (90, 90, 90), 2)
+
+def viz_proc(input_path, data_path, in_queue, fps_calc, nusc, demo=None,
+             title='BEV demo - Hailo-8', label='HAILO-8 DETECTIONS') -> None:
     """
     Visualization process that handles displaying images, annotations, and 3D bounding boxes in a window.
 
-    This function runs in an infinite loop, fetching camera images and annotations for a given token from the
-    `in_queue`, and renders these images with bounding boxes and other visualizations in a window. It also handles
-    FPS calculation and updating.
+    This function fetches annotations for a given token from the `in_queue`, and renders the camera images
+    with bounding boxes and the bird's-eye view in a window. It also handles FPS calculation and updating.
+
+    The last frames are kept, so that playback can be paused and stepped through with the keyboard
+    (Space, Left/Right arrows) or with the buttons under the images. While paused, the pipeline
+    upstream waits, since its queues are full.
 
     Args:
         in_queue (Queue): A queue that provides camera images and annotation data (in the form of a tuple `(annos, token)`).
         fps_calc (fps_calc.FPSCalc): An instance of the `FPSCalc` class used to calculate and update FPS.
         nusc (NuScenes): An instance of the `NuScenes` class to fetch data from the nuScenes dataset (camera images, annotations, etc.).
+        demo (object, optional): A demo object that handles termination signals. If not given, the function runs
+        until the process is terminated or the window is closed.
+        title (str): Window title, to tell instances apart when several run side by side.
+        label (str): Source of the boxes, shown under the images with the scene and frame number.
 
     Returns:
-        None: The function runs indefinitely, continuously processing and displaying visualizations.
+        None: The function runs until the termination signal is received from the `demo` object,
+        or until the user quits.
     """
-    cv2.namedWindow('Video', cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty('Video', cv2.WND_PROP_AUTOSIZE, cv2.WINDOW_NORMAL)
-    while True:
-        cam_images = []
-        annos, token = in_queue.get()
-        cams = ['CAM_FRONT_LEFT','CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    # Scene and frame number of each sample, to line up instances showing the same data
+    with open(f'{input_path}/tokens.json', 'r', encoding='utf-8') as file:
+        scenes = json.load(file)['scenes']
+    positions = {}
+    for scene_index, scene in enumerate(scenes):
+        frames = [token for token in scene['tokens'] if not token.startswith('first')]
+        for frame_index, token in enumerate(frames):
+            positions[token] = f'scene {scene_index + 1}/{len(scenes)}   frame {frame_index + 1}/{len(frames)}'
 
-        for cam in cams:
-            img = cv2.imread(data_path + nusc[token][cam][2]['filename'])
-            cam_images.append(np.array(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
-        bev_image = cv2.imread(input_path + nusc[token]['LIDAR_TOP'][2]['filename'])
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(title, cv2.WND_PROP_AUTOSIZE, cv2.WINDOW_NORMAL)
+    # The frame is 2800x916; open the window at half size instead of Qt's default 400x300
+    cv2.resizeWindow(title, 1400, 458)
 
-        cv2.rectangle(bev_image, (int(TOP_IMAGE_SIZE[0]/2) - 20,
-                                    int(TOP_IMAGE_SIZE[0]/2) - 10),
-                                    (int(TOP_IMAGE_SIZE[0]/2) + 20,
-                                    int(TOP_IMAGE_SIZE[0]/2) + 10),
-                                    COLOR_GREEN, thickness=LINE_WIDTH)
+    clicks = []
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for action, bx, by in BUTTONS:
+                if bx <= x <= bx + BUTTON_SIZE[0] and by <= y <= by + BUTTON_SIZE[1]:
+                    clicks.append(action)
+    cv2.setMouseCallback(title, on_mouse)
 
-        top_image = show_bev(bev_image,annos,token, nusc)
-        current_images = []
-        j= 0
+    # cv2.imread releases the GIL, so the 6 camera images can be decoded in parallel
+    read_pool = ThreadPoolExecutor(max_workers=6)
+    history = deque(maxlen=HISTORY_SIZE)  # (sequence number, annos, token) of the last frames received
+    received = 0
+    position = -1  # index in history of the frame on screen
+    paused = False
+    step_pending = False
+    shown = None  # (sequence number, paused) of the frame on screen, to redraw only when it changes
+    frame = None
 
-        for cam_image, cam in zip(cam_images, cams):
-            if j < NUM_OF_IMAGES:
-                show_image_with_boxes(token, cam_image, cam, annos, nusc)
-                current_images.append(cam_image)
-            j = j + 1
+    while demo is None or not demo.get_terminate():
+        key = cv2.waitKeyEx(30 if paused else 1)
+        try:
+            window_closed = cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
+        except cv2.error:
+            window_closed = True
+        if key in KEYS_QUIT or window_closed:
+            if demo is not None:
+                demo.set_terminate()
+            break
 
-        combine_img = combine_images(current_images, top_image, fps_calc)
-        frame = cv2.cvtColor(np.array(combine_img), cv2.COLOR_RGB2BGR)
-        cv2.imshow('Video', frame)
-        cv2.waitKey(1)  # Wait indefinitely for a key press
-        fps_calc.update_fps()
+        actions = clicks[:]
+        clicks.clear()
+        if key in KEYS_PREVIOUS:
+            actions.append('previous')
+        elif key in KEYS_NEXT:
+            actions.append('next')
+        elif key in KEYS_PLAY_PAUSE:
+            actions.append('play_pause')
+        for action in actions:
+            if action == 'play_pause':
+                paused = not paused
+                if not paused:
+                    fps_calc.restart()
+            elif action == 'previous':
+                paused = True
+                if position > 0:
+                    position -= 1
+            elif action == 'next':
+                paused = True
+                step_pending = True
+
+        new_frame = False
+        if not paused or step_pending:
+            if position < len(history) - 1:
+                # Replay frames the user stepped back over
+                position += 1
+                step_pending = False
+            else:
+                try:
+                    annos, token = in_queue.get(block=True, timeout=0.1)
+                except queue.Empty:
+                    continue
+                history.append((received, annos, token))
+                received += 1
+                position = len(history) - 1
+                step_pending = False
+                new_frame = True
+
+        if position < 0:
+            continue
+        sequence, annos, token = history[position]
+        if shown == (sequence, paused):
+            continue
+        if shown is None or shown[0] != sequence:
+            frame = render_frame(input_path, data_path, annos, token, nusc, fps_calc, read_pool)
+        frames_back = len(history) - 1 - position
+        if paused:
+            status = 'PAUSED' + (f'   ({frames_back} back)' if frames_back else '')
+        elif frames_back:
+            status = f'REPLAY   {frames_back} frame{"s" if frames_back > 1 else ""} behind live'
+        else:
+            status = f'LIVE   {float(fps_calc.get_fps()):.1f} FPS'
+        shown_frame = frame.copy()
+        draw_controls(shown_frame, paused, status, f'{label}   {positions.get(token, "")}')
+        cv2.imshow(title, shown_frame)
+        shown = (sequence, paused)
+        if new_frame:
+            fps_calc.update_fps()
+
+    read_pool.shutdown()
+    cv2.destroyAllWindows()

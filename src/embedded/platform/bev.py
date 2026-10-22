@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--jpg-input', action='store_true', help='Run the demo using .jpg data input, may require more CPU power.')
     parser.add_argument('--set-port', default=5555, type=int, help="Change the port from 5555 to another one.")
     parser.add_argument('--set-ip', default='127.0.0.1', help="Set platform's ip.")
+    parser.add_argument('--score-threshold', default=pre_post_process.DEFAULT_SCORE_THRESHOLD, type=float, help=f'Hide detections with a lower confidence score (default {pre_post_process.DEFAULT_SCORE_THRESHOLD}, 0 shows all).')
+    parser.add_argument('--prev-frame-gap', default=core.DEFAULT_PREV_FRAME_GAP, type=float, help=f'Time between the current frame and the earlier frame the model uses with it, in seconds (default {core.DEFAULT_PREV_FRAME_GAP}). Mostly useful with --sweeps data.')
+    parser.add_argument('--no-tracker', action='store_true', help='Show the detections of each frame as they are, without tracking the objects across frames.')
     parser.add_argument("-i", "--input", default="resources/input/", help="Path to the input folder, Use this flag only if you have modified the default input folder location.")
     parser.add_argument("-m", "--models", default="resources/models/", help="Path to the models folder, Use this flag only if you have modified the default models folder location.")
     parser.add_argument("-d", "--data", default="resources/data/", help="Path to the data folder, where the nuScenes dataset is.")
@@ -66,7 +69,12 @@ if __name__ == "__main__":
 
     with open(f'{args.input}/tokens.json', 'r', encoding='utf-8') as f:
         scenes = json.load(f)
-        scenes = scenes['scenes']
+    # Data prepared with --sweeps (~12 Hz) is played at the recorded pace
+    sweeps = scenes.get('sweeps', False)
+    scenes = scenes['scenes']
+    timestamps = {token: timestamp for scene in scenes for token, timestamp in zip(scene['tokens'], scene.get('timestamps', []))}
+    # The first sample of each scene (after its 'first_' duplicate), where the tracker restarts
+    scene_starts = {scene['tokens'][1] for scene in scenes if len(scene['tokens']) > 1}
 
     with open(f'{args.input}/nusc_tiny_dataset.json', 'r', encoding='utf-8') as file:
         nusc = json.load(file)
@@ -84,20 +92,20 @@ if __name__ == "__main__":
     with VDevice(params) as target:
         if args.jpg_input:
             threads.append(threading.Thread(target=core.backbone_from_jpg, args=(target, args.data, backbone_hef_path, bb_tranformer_queue,
-                                                    bb_tranformer_meta_queue, demo_mng, scenes, args.run_slow, nusc)))
+                                                    bb_tranformer_meta_queue, demo_mng, scenes, args.run_slow, nusc, sweeps)))
         else:
             threads.append(threading.Thread(target=core.backbone_raw_data, args=(target, args.input, backbone_hef_path, bb_tranformer_queue,
-                                                    bb_tranformer_meta_queue, demo_mng, scenes, args.run_slow)))
+                                                    bb_tranformer_meta_queue, demo_mng, scenes, args.run_slow, sweeps)))
 
 
         threads.append(threading.Thread(target=core.transformer, args=(target, transformer_hef_path,
-                                                                       matmul_path, bb_tranformer_queue, bb_tranformer_meta_queue, transformer_pp_queue, transformer_pp_meta_queue, demo_mng)))
+                                                                       matmul_path, bb_tranformer_queue, bb_tranformer_meta_queue, transformer_pp_queue, transformer_pp_meta_queue, demo_mng, timestamps, args.prev_frame_gap)))
 
         processes.append(multiprocessing.Process(target=pre_post_process.post_proc,
                                                 args=(transformer_pp_queue, transformer_pp_meta_queue,
                                                 pp_3dnms_queue, post_proc_onnx_path, demo_mng)))
         processes.append(multiprocessing.Process(target=pre_post_process.d3nms_proc,
-                                                args=(pp_3dnms_queue, nms_send_queue,nusc, demo_mng)))
+                                                args=(pp_3dnms_queue, nms_send_queue,nusc, demo_mng, args.score_threshold, not args.no_tracker, timestamps, scene_starts)))
         processes.append(multiprocessing.Process(target=server.start_server,
                                                 args=(nms_send_queue, demo_mng, args.set_port, args.set_ip)))
 
@@ -118,6 +126,9 @@ if __name__ == "__main__":
         finally:
             for thread in threads:
                 thread.join()
+
+            # Release the inference models from the main thread, before the VDevice
+            async_api.release_all()
 
             for process in processes:
                 process.join()

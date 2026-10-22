@@ -58,7 +58,10 @@ Requirements
 
 4. Data creation:
     
-    Download the mini dataset from https://www.nuscenes.org/nuscenes#download
+    Download the **Mini** version of the **Full dataset (v1.0)** of nuScenes from https://www.nuscenes.org/nuscenes#download (a free account is required).
+    - **Note**: The download page also lists other datasets first, such as nuScenes-lidarseg, nuScenes-panoptic or nuImages. These only add annotations or contain other images, and do not work with this demo. Scroll down to **Full dataset (v1.0)** and download the **Mini** archive (``v1.0-mini.tgz``, about 5 GB once extracted).
+
+    After extracting it, the dataset folder (the ``<path to nuScenes dataset>`` used below) should contain ``maps/``, ``samples/``, ``sweeps/`` and ``v1.0-mini/``.
     
     To run the demo with **.jpg** input, use:
 
@@ -71,6 +74,21 @@ Requirements
     ```shell script
     ./src/common/prepare_data.py --data <path to nuScenes dataset> --raw-data
     ```
+
+    By default all the scenes of the dataset are prepared (10 scenes of about 20 s in v1.0-mini). To choose the scenes and their playback order, use ``--scenes`` with scene indices or names:
+
+    ```shell script
+    ./src/common/prepare_data.py --data <path to nuScenes dataset> --scenes 1 3 6 8
+    ./src/common/prepare_data.py --data <path to nuScenes dataset> --scenes scene-0103 scene-1077
+    ```
+    With ``--raw-data``, each scene takes about 190 MB on disk. It is read from disk while the demo runs.
+
+    By default, only the annotated keyframes are used (2 Hz, about 40 frames per scene). To use every camera frame instead (~12 Hz, including the unannotated sweeps between keyframes, about 230 frames per scene), add ``--sweeps``. The demo then plays the frames at the recorded pace, for smooth real-time video:
+
+    ```shell script
+    ./src/common/prepare_data.py --data <path to nuScenes dataset> --sweeps
+    ```
+    With ``--sweeps --raw-data``, each scene takes about 1.1 GB on disk. In ``--ground-truth`` mode, the boxes of the frames between keyframes are interpolated from the surrounding keyframes.
 
 # Install the Demo - Embedded Architecture
 ------------------------------------------
@@ -96,7 +114,10 @@ Requirements
 
 4. Data creation:
     
-    Download the mini dataset from https://www.nuscenes.org/nuscenes#download
+    Download the **Mini** version of the **Full dataset (v1.0)** of nuScenes from https://www.nuscenes.org/nuscenes#download (a free account is required).
+    - **Note**: The download page also lists other datasets first, such as nuScenes-lidarseg, nuScenes-panoptic or nuImages. These only add annotations or contain other images, and do not work with this demo. Scroll down to **Full dataset (v1.0)** and download the **Mini** archive (``v1.0-mini.tgz``, about 5 GB once extracted).
+
+    After extracting it, the dataset folder (the ``<path to nuScenes dataset>`` used below) should contain ``maps/``, ``samples/``, ``sweeps/`` and ``v1.0-mini/``.
     
     **Execute this command on the **host** only:**
     
@@ -111,6 +132,21 @@ Requirements
     ```shell script
     ./src/common/prepare_data.py --data <path to nuScenes dataset> --raw-data
     ```
+
+    By default all the scenes of the dataset are prepared (10 scenes of about 20 s in v1.0-mini). To choose the scenes and their playback order, use ``--scenes`` with scene indices or names:
+
+    ```shell script
+    ./src/common/prepare_data.py --data <path to nuScenes dataset> --scenes 1 3 6 8
+    ./src/common/prepare_data.py --data <path to nuScenes dataset> --scenes scene-0103 scene-1077
+    ```
+    With ``--raw-data``, each scene takes about 190 MB on disk. It is read from disk while the demo runs.
+
+    By default, only the annotated keyframes are used (2 Hz, about 40 frames per scene). To use every camera frame instead (~12 Hz, including the unannotated sweeps between keyframes, about 230 frames per scene), add ``--sweeps``. The demo then plays the frames at the recorded pace, for smooth real-time video:
+
+    ```shell script
+    ./src/common/prepare_data.py --data <path to nuScenes dataset> --sweeps
+    ```
+    With ``--sweeps --raw-data``, each scene takes about 1.1 GB on disk. In ``--ground-truth`` mode, the boxes of the frames between keyframes are interpolated from the surrounding keyframes.
     After running the command on the **host**, copy the /resources/input/ directory to the platform.
     - **Note**: The /resources/input/ folder must be present on both the host and the platform.
 
@@ -133,6 +169,10 @@ For optimal visibility of 3D boxes, use the --run-slow flag. This will run the d
 - ``-d, --data``: Path to the data folder, where the nuScenes dataset is.
 - ``--run-slow``: Run the demo at 5 FPS for better visualization of 3D boxes.
 - ``--raw-data``: Run the demo from raw data for lower cpu usage.
+- ``--score-threshold``: Hide detections with a lower confidence score (default 0.45, use 0 to show all).
+- ``--ground-truth``: Show the nuScenes ground-truth boxes instead of the Hailo detections. Does not use the Hailo device.
+- ``--prev-frame-gap``: Time between the current frame and the earlier frame the model uses with it, in seconds (default 0.25). With keyframes, the previous keyframe (0.5 s earlier) is always used.
+- ``--no-tracker``: Show the detections of each frame as they are. By default, the objects are tracked across frames (3D tracker in the style of ByteTrack) for steadier boxes: with ``--sweeps`` data, boxes flicker about 80% less and jitter about 65% less, at the same precision; with keyframes only, the gain is smaller.
 
 
 **Example**
@@ -141,6 +181,23 @@ For optimal visibility of 3D boxes, use the --run-slow flag. This will run the d
 ./src/x86/bev.py --run-slow
 ```
 *Press Ctrl-C to stop the demo.*
+
+**Window controls**
+
+- ``Space`` or the middle button: pause / resume.
+- ``Left`` / ``Right`` arrows or the side buttons: pause and step one frame back / forward. The last 300 frames are kept; stepping forward past the newest frame waits for the next one from the pipeline. Resuming replays the frames you stepped back over, then continues live.
+- ``Q``, ``Esc`` or closing the window: stop the demo.
+
+The arrows in the window toolbar are OpenCV's pan buttons (they only move the view when zoomed in), not playback controls.
+
+**Comparing with the ground truth**
+
+Run a second instance with ``--ground-truth`` next to a Hailo instance. It shows the annotated boxes of the same frames, filtered like the detections (the 10 detection classes, the same range per class, and only objects seen by the lidar or radar). Each window shows its source and the scene and frame number, which you can line up with the playback controls:
+```shell script
+./src/x86/bev.py -d <data_path> --run-slow
+./src/x86/bev.py -d <data_path> --run-slow --ground-truth
+```
+
 # Run Inference - Embedded Architecture
 -----------------------------------------
 
@@ -167,6 +224,9 @@ For optimal visibility of 3D boxes, use the --run-slow flag. This will run the d
 - ``--jpg-input``: Run the demo using .jpg data input, may require more CPU power.
 - ``--set-ip``: Set platform's ip.
 - ``--set-port``: Change the port from 5555 to another one.
+- ``--score-threshold``: Hide detections with a lower confidence score (default 0.45, use 0 to show all).
+- ``--prev-frame-gap``: Time between the current frame and the earlier frame the model uses with it, in seconds (default 0.25). With keyframes, the previous keyframe (0.5 s earlier) is always used.
+- ``--no-tracker``: Show the detections of each frame as they are. By default, the objects are tracked across frames (3D tracker in the style of ByteTrack) for steadier boxes: with ``--sweeps`` data, boxes flicker about 80% less and jitter about 65% less, at the same precision; with keyframes only, the gain is smaller.
 
 **Example**
 
@@ -202,9 +262,38 @@ Run visualization:
 ```
 *Press Ctrl-C to stop the demo.*
 
+**Window controls**
+
+- ``Space`` or the middle button: pause / resume.
+- ``Left`` / ``Right`` arrows or the side buttons: pause and step one frame back / forward. The last 300 frames are kept; stepping forward past the newest frame waits for the next one from the pipeline. Resuming replays the frames you stepped back over, then continues live.
+- ``Q``, ``Esc`` or closing the window: stop the demo.
+
+The arrows in the window toolbar are OpenCV's pan buttons (they only move the view when zoomed in), not playback controls.
+
+
 Additional Notes
 ----------------
 - Ran the demo on: Dell PC (Model: Latitude 5431), with CPU (Model: 12th Gen Intel(R) Core(TM) i7-1270P).
+- Running the demo at 12 FPS loads the Hailo-8 at about 70% utilization, with an average power consumption of 2 W. To measure it:
+    1. In a first terminal, enable the HailoRT monitor and run the demo:
+        ```shell script
+        export HAILO_MONITOR=1
+        ./src/x86/bev.py -d <data_path>
+        ```
+    2. In a second terminal, show the utilization of the Hailo-8:
+        ```shell script
+        hailortcli monitor
+        ```
+    3. In a third terminal, measure the average power consumption over 30 seconds:
+        ```shell script
+        hailortcli measure-power --duration 30
+        ```
+- The demo's frame rate is limited by the computation on the CPU (image decoding, post-processing and visualization), not by the Hailo-8, so results may vary depending on the host system.
+- To measure the raw performance of the Hailo-8 alone, use ``hailortcli run2``. For example, on a system with a 2-lane PCIe Gen 3 link, the maximum is 16 FPS at 2 W, obtained by running from the ``resources/models/`` folder:
+    ```shell script
+    hailortcli run2 --measure-power -t 30 set-net petrv2_repvggB0_backbone_pp_800x320.hef --framerate 98 --scheduler-priority 16 set-net petrv2_repvggB0_transformer_pp_800x320.hef --framerate 16 --scheduler-priority 15
+    ```
+    The Hailo-8 utilization was already at 95% for this measurement, so a host system with a 4-lane PCIe link would not improve it much.
 - All data is computed at runtime, except of the map, which is derived from the ground truth.
 
 License

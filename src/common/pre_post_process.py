@@ -10,17 +10,25 @@ import pyquaternion
 import torch
 from nuscenes.utils.data_classes import Box
 import cv2
+import tracker
+from concurrent.futures import ThreadPoolExecutor
+
+# Detections with a lower confidence score are not shown
+DEFAULT_SCORE_THRESHOLD = 0.45
+
+# cv2.imread releases the GIL, so the 6 camera images can be decoded in parallel
+_read_pool = ThreadPoolExecutor(max_workers=6)
+
+def _read_and_crop(path):
+    # Decoding at half resolution (1600x900 -> 800x450) is much faster than a full decode followed by a resize
+    img = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_2)
+    if img.shape[:2] != (450, 800):
+        img = cv2.resize(img, (800, 450))
+    x, y, width, height = 0, 130, 800, 450
+    return img[y:y + height, x:x + width]
 
 def preprocess(data_path, files):
-    images_after_pre = []
-    for filename in files:
-        img = cv2.imread(data_path + filename)
-        img = cv2.resize(img, (800, 450))
-        x, y, width, height = 0, 130, 800, 450  
-        img = img[y:y + height, x:x + width]
-
-        images_after_pre.append(img)
-    return np.array(images_after_pre)
+    return np.array(list(_read_pool.map(_read_and_crop, [data_path + filename for filename in files])))
 
 def post_proc(in_queue, in_meta_queue, out_queue, post_proc_onnx_path, demo) -> None:
     """
@@ -49,6 +57,9 @@ def post_proc(in_queue, in_meta_queue, out_queue, post_proc_onnx_path, demo) -> 
     timest = np.array([1.25]).astype(np.float32)
 
     output_names = [x.name for x in sess_post_proc.get_outputs()]
+
+    # Don't block on exit flushing results that the stopped consumer will never read
+    out_queue.cancel_join_thread()
 
     while True:
         while not demo.get_terminate():
@@ -435,7 +446,8 @@ def _format_bbox(results, sample, nusc) -> str:
             token = token + 1
     return result_annos
 
-def d3nms_proc(in_queue, out_queue, nusc, demo) -> None:
+def d3nms_proc(in_queue, out_queue, nusc, demo, score_threshold=DEFAULT_SCORE_THRESHOLD,
+               tracking=True, timestamps=None, scene_starts=None) -> None:
     """
     Perform 3D Non-Maximum Suppression (NMS) and annotation formatting for NuScenes dataset.
 
@@ -446,6 +458,12 @@ def d3nms_proc(in_queue, out_queue, nusc, demo) -> None:
     - iterations_num (int): Number of iterations to process.
     - infinite_loop (bool): Flag indicating whether to loop infinitely.
     - nusc (NuScenes): NuScenes database instance.
+    - demo (object): A demo object that handles termination signals.
+    - score_threshold (float): Detections with a lower confidence score are dropped.
+    - tracking (bool): Show tracked objects (default) instead of the detections of each frame (see tracker.py). The tracker
+      also uses the detections below score_threshold, to keep existing tracks alive.
+    - timestamps (dict, optional): Sample token -> capture time in seconds, for the tracker.
+    - scene_starts (set, optional): Tokens of the first sample of each scene, where the tracker is reset.
 
     Returns:
     - None
@@ -459,6 +477,10 @@ def d3nms_proc(in_queue, out_queue, nusc, demo) -> None:
     - Puts formatted annotations into 'out_queue'.
     """
 
+    # Don't block on exit flushing results that the stopped consumer will never read
+    out_queue.cancel_join_thread()
+
+    object_tracker = tracker.Tracker(score_threshold) if tracking else None
     while True:
         while not demo.get_terminate():
             try:
@@ -473,6 +495,13 @@ def d3nms_proc(in_queue, out_queue, nusc, demo) -> None:
         assert pp_output.shape == (2, 1, 1, 304, 10),  "Expected shape of Post-process output is (2, 1, 1, 304, 10), but got {}".format(pp_output.shape)
         bbox_list = decode(pp_output)
         annos = _format_bbox(bbox_list, meta_data, nusc)
+        if object_tracker is not None:
+            if scene_starts and meta_data in scene_starts:
+                object_tracker.reset()
+            annos = object_tracker.update(annos, meta_data, (timestamps or {}).get(meta_data))
+        else:
+            # The decoder always keeps the top 30 detections, many of them low-confidence guesses
+            annos = [anno for anno in annos if anno['detection_score'] >= score_threshold]
         while not demo.get_terminate():
             try:
                 out_queue.put((annos, meta_data), block=True, timeout=0.5)

@@ -55,14 +55,15 @@ def start_server(in_queue, demo, port, host=None) -> None:
         while True:
             while not demo.get_terminate():
                 try:
-                    data, _ = in_queue.get(block=True, timeout=1)
+                    annos, token = in_queue.get(block=True, timeout=1)
                     break
                 except queue.Empty:
                     pass
             if demo.get_terminate():
                 client_socket.close()
                 break
-            json_data = json.dumps(data)
+            # Send the sample token explicitly: a frame can have no detections to take it from
+            json_data = json.dumps({'token': token, 'annos': annos})
             json_bytes = json_data.encode('utf-8')
 
             # Send the length of the message first

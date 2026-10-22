@@ -1,9 +1,12 @@
 # pylint: disable=E0401
 import queue
+import threading
+import time
 from functools import partial
 from loguru import logger
 import numpy as np
 from hailo_platform import (HEF, VDevice, FormatType, HailoSchedulingAlgorithm)
+from hailo_platform.pyhailort.pyhailort import HailoRTTimeout
 
 
 def create_vdevice_params():
@@ -14,6 +17,45 @@ def create_vdevice_params():
     params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
     params.multi_process_service = False
     return params
+
+# Every HailoAsyncInference created, kept referenced until release_all()
+_instances = []
+
+class _JobCounter:
+    """
+    Counts the inference jobs whose callback has not finished yet.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.count = 0
+
+    def add(self, value):
+        with self._lock:
+            self.count += value
+
+def release_all(timeout=5.0) -> None:
+    """
+    Waits for pending jobs, then releases every HailoAsyncInference from the calling thread.
+    Call it from the main thread, after the inference threads are joined and before releasing the VDevice.
+
+    HailoRT's Python completion callback keeps a reference to the ConfiguredInferModel. If the last reference
+    is dropped on HailoRT's callback thread, the model's destructor tries to join that thread from itself and
+    the process aborts ("Resource deadlock avoided"). Keeping every model referenced here until its jobs are
+    done makes sure it is destroyed on the calling thread instead.
+    (ConfiguredInferModel.shutdown() is not called: it sometimes blocks forever at this point.)
+
+    Args:
+        timeout (float): Max time to wait for the pending jobs of each model, in seconds.
+    """
+    for inference in _instances:
+        deadline = time.time() + timeout
+        while inference.pending_jobs.count > 0 and time.time() < deadline:
+            time.sleep(0.01)
+        if inference.pending_jobs.count > 0:
+            logger.warning(f'{inference.pending_jobs.count} inference jobs still pending after {timeout} s')
+    # Our callback is done, give HailoRT's callback wrapper time to return and drop its reference
+    time.sleep(0.2)
+    _instances.clear()
 
 class HailoAsyncInference:
     def __init__(self, target, hef_path, queue_out, demo,
@@ -39,8 +81,9 @@ class HailoAsyncInference:
         self.input_vstream_info, self.output_vstream_info = self._get_vstream_info()
         self.configured_infer_model = self.infer_model.configure()
         self.queue = queue_out
-        self.outputs = []
         self.batch_size = batch_size
+        self.pending_jobs = _JobCounter()
+        _instances.append(self)
 
 
     def _set_input_output(self, output_type, input_type):
@@ -55,27 +98,36 @@ class HailoAsyncInference:
         for name in self.output_names:
             self.infer_model.output(name).set_format_type(getattr(FormatType, output_type))
 
-    def callback(self, completion_info, all_bindings, out_queue):
+    @staticmethod
+    def callback(completion_info, all_bindings, out_queue, output_names, demo, pending_jobs):
         """
         Callback function for handling inference results.
+
+        It is static so that it holds no reference to the HailoAsyncInference object, see release_all().
 
         Args:
             completion_info: Information about the completion of the inference task.
             bindings: Bindings object containing input and output buffers.
         """
+        try:
+            HailoAsyncInference._handle_results(completion_info, all_bindings, out_queue, output_names, demo)
+        finally:
+            pending_jobs.add(-1)
 
+    @staticmethod
+    def _handle_results(completion_info, all_bindings, out_queue, output_names, demo):
         if completion_info.exception:
             logger.error(f'Inference error: {completion_info.exception}')
         else:
-            self.outputs = {}
-            for name in self.output_names:
-                self.outputs[name] = []
+            outputs = {}
+            for name in output_names:
+                outputs[name] = []
                 for binding in all_bindings:
-                    self.outputs[name].append(binding.output(name).get_buffer())
+                    outputs[name].append(binding.output(name).get_buffer())
 
-            while not self.demo.get_terminate():
+            while not demo.get_terminate():
                 try:
-                    out_queue.put(self.outputs, block=True, timeout=0.5)
+                    out_queue.put(outputs, block=True, timeout=0.5)
                     break
                 except queue.Full:
                     pass
@@ -98,7 +150,7 @@ class HailoAsyncInference:
             input_data (np.ndarray): Input data for inference.
 
         Returns:
-            list: List of inference outputs.
+            AsyncInferJob: The async inference job, or None if the demo was terminated while waiting.
         """
 
         all_bindings = []
@@ -109,10 +161,24 @@ class HailoAsyncInference:
 
             all_bindings.append(bindings)
 
-        self.configured_infer_model.wait_for_async_ready(timeout_ms=1000)
+        # Wait for room for the whole batch: submitting more frames than the queue can hold
+        # fails with HAILO_QUEUE_IS_FULL and shuts down the inference pipeline
+        while True:
+            try:
+                self.configured_infer_model.wait_for_async_ready(timeout_ms=1000, frames_count=len(all_bindings))
+                break
+            except HailoRTTimeout:
+                if self.demo.get_terminate():
+                    return None
 
-        job = self.configured_infer_model.run_async(all_bindings,
-                            partial(self.callback, all_bindings=all_bindings, out_queue=self.queue))
+        self.pending_jobs.add(1)
+        try:
+            job = self.configured_infer_model.run_async(all_bindings,
+                                partial(HailoAsyncInference.callback, all_bindings=all_bindings, out_queue=self.queue,
+                                        output_names=self.output_names, demo=self.demo, pending_jobs=self.pending_jobs))
+        except Exception:
+            self.pending_jobs.add(-1)
+            raise
 
         return job
 

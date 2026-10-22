@@ -48,7 +48,7 @@ def start_client(out_queue, port, host=None) -> None:
                     return
                 json_data += chunk
             message = json.loads(json_data.decode('utf-8'))
-            out_queue.put((message, message[0]['sample_token']))
+            out_queue.put((message['annos'], message['token']))
 
             # Optional: Wait before sending the next message
 

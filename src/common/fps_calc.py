@@ -43,3 +43,11 @@ class FPSCalc:
 
     def get_fps(self):
         return self.fps
+
+    def restart(self) -> None:
+        """
+        Start a new measurement window, so that a pause is not counted in the average FPS.
+        """
+        if self.start_time_stamp != 0:
+            self.last_time_stamp = time.time()
+            self.prev_frame_count = self.frame_count

@@ -6,7 +6,6 @@
 # pylint: disable=C0103
 # pylint: disable=E0401
 # pylint: disable=C0413
-import time
 import argparse
 import os
 import multiprocessing
@@ -48,10 +47,13 @@ if __name__ == "__main__":
     try:
         get_process.start()
         visualize_process.start()
-        time.sleep(1000000000)
+        # Returns when the user quits from the window (Q, Esc or closing it)
+        visualize_process.join()
 
     except KeyboardInterrupt:
-        get_process.terminate()
-        visualize_process.terminate()
-        d3nms_out_vis_in_queue.close()
-        os._exit(0)
+        pass
+
+    get_process.terminate()
+    visualize_process.terminate()
+    d3nms_out_vis_in_queue.close()
+    os._exit(0)
