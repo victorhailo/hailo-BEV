@@ -16,6 +16,7 @@ sys.path.append('src/common')
 import fps_calc
 import visualization
 import client
+import startup_checks
 
 MAX_QUEUE_SIZE = 5
 
@@ -31,9 +32,12 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    args.input, args.data = startup_checks.as_dir(args.input), startup_checks.as_dir(args.data)
+    startup_checks.check_input(args.input)
     d3nms_out_vis_in_queue = multiprocessing.Queue(maxsize=MAX_QUEUE_SIZE)
     with open(f'{args.input}/nusc_tiny_dataset.json', 'r', encoding='utf-8') as file:
         nusc = json.load(file)
+    startup_checks.check_data(args.data, nusc)
     fps_calculator = fps_calc.FPSCalc(2)
 
 

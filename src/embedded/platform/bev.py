@@ -24,6 +24,7 @@ import demo_manager
 import fps_calc
 import async_api
 import server
+import startup_checks
 
 
 MAX_QUEUE_SIZE = 3
@@ -47,6 +48,9 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    args.input, args.models, args.data = (startup_checks.as_dir(path) for path in (args.input, args.models, args.data))
+    startup_checks.check_input(args.input)
+    startup_checks.check_models(args.models)
     backbone_hef_path = f'{args.models}/petrv2_repvggB0_backbone_pp_800x320.hef'
     transformer_hef_path = f'{args.models}/petrv2_repvggB0_transformer_pp_800x320.hef'
     post_proc_onnx_path = f'{args.models}/petrv2_postprocess.onnx'
@@ -78,6 +82,8 @@ if __name__ == "__main__":
 
     with open(f'{args.input}/nusc_tiny_dataset.json', 'r', encoding='utf-8') as file:
         nusc = json.load(file)
+    if args.jpg_input:
+        startup_checks.check_data(args.data, nusc)
 
     fps_calculator = fps_calc.FPSCalc(10)
 
@@ -89,16 +95,17 @@ if __name__ == "__main__":
     processes = []
     params = VDevice.create_params()
     params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+    errors = []  # names of the pipeline threads or processes that failed
     with VDevice(params) as target:
         if args.jpg_input:
-            threads.append(threading.Thread(target=core.backbone_from_jpg, args=(target, args.data, backbone_hef_path, bb_tranformer_queue,
+            threads.append(threading.Thread(target=startup_checks.stop_demo_on_error(core.backbone_from_jpg, demo_mng, errors), args=(target, args.data, backbone_hef_path, bb_tranformer_queue,
                                                     bb_tranformer_meta_queue, demo_mng, scenes, args.run_slow, nusc, sweeps)))
         else:
-            threads.append(threading.Thread(target=core.backbone_raw_data, args=(target, args.input, backbone_hef_path, bb_tranformer_queue,
+            threads.append(threading.Thread(target=startup_checks.stop_demo_on_error(core.backbone_raw_data, demo_mng, errors), args=(target, args.input, backbone_hef_path, bb_tranformer_queue,
                                                     bb_tranformer_meta_queue, demo_mng, scenes, args.run_slow, sweeps)))
 
 
-        threads.append(threading.Thread(target=core.transformer, args=(target, transformer_hef_path,
+        threads.append(threading.Thread(target=startup_checks.stop_demo_on_error(core.transformer, demo_mng, errors), args=(target, transformer_hef_path,
                                                                        matmul_path, bb_tranformer_queue, bb_tranformer_meta_queue, transformer_pp_queue, transformer_pp_meta_queue, demo_mng, timestamps, args.prev_frame_gap)))
 
         processes.append(multiprocessing.Process(target=pre_post_process.post_proc,
@@ -119,6 +126,11 @@ if __name__ == "__main__":
 
             while not demo_mng.get_terminate():
                 time.sleep(1)
+                # A pipeline process that crashed would leave the others waiting for its output forever
+                failed = [process.name for process in processes if process.exitcode not in (None, 0)]
+                if failed:
+                    errors.extend(failed)
+                    demo_mng.set_terminate()
 
 
         except KeyboardInterrupt:
@@ -137,4 +149,7 @@ if __name__ == "__main__":
                 queue_to_close.close()
 
             target.release()
+
+    if errors:
+        sys.exit(f'Error: the demo stopped because {", ".join(errors)} failed, see the error above.')
 

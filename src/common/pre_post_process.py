@@ -22,6 +22,8 @@ _read_pool = ThreadPoolExecutor(max_workers=6)
 def _read_and_crop(path):
     # Decoding at half resolution (1600x900 -> 800x450) is much faster than a full decode followed by a resize
     img = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_2)
+    if img is None:
+        raise FileNotFoundError(f'Cannot read image {path}')
     if img.shape[:2] != (450, 800):
         img = cv2.resize(img, (800, 450))
     x, y, width, height = 0, 130, 800, 450

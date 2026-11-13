@@ -352,6 +352,8 @@ def read_cam_image(path) -> np.ndarray:
     # Decode at half resolution (800x450), which is much faster, then shrink to the displayed size,
     # so that the boxes are drawn at the final resolution instead of being thinned by a later resize
     image = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_2)
+    if image is None:
+        raise FileNotFoundError(f'Cannot read image {path}')
     image = cv2.resize(image, (IMAGE_WIDTH, IMAGE_HEIGHT))
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
@@ -362,6 +364,8 @@ def render_frame(input_path, data_path, annos, token, nusc, fps_calc, read_pool)
     cams = ['CAM_FRONT_LEFT','CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     cam_images = list(read_pool.map(read_cam_image, [data_path + nusc[token][cam][2]['filename'] for cam in cams]))
     bev_image = cv2.imread(input_path + nusc[token]['LIDAR_TOP'][2]['filename'])
+    if bev_image is None:
+        raise FileNotFoundError(f"Cannot read map image {input_path + nusc[token]['LIDAR_TOP'][2]['filename']}")
 
     cv2.rectangle(bev_image, (int(TOP_IMAGE_SIZE[0]/2) - 20,
                                 int(TOP_IMAGE_SIZE[0]/2) - 10),
