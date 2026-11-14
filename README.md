@@ -30,7 +30,7 @@ However, CPU usage will be lower because data loading does not occur in real tim
 Requirements
 ------------
 
-- hailo_platform==4.19.0
+- hailo_platform==4.24.0
 - Pyhailort
 
 
